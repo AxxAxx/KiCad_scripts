@@ -5,7 +5,6 @@ import shutil
 folder_structure = [['3rd-parties-libraries', '3D-models', 'componentsearchengine_ZIP_archive', 'footprints.pretty', 'schematic-symbols'], ['board-dimensions'], ['bom'], ['datasheets'], ['fabrication'], ['images'], ['logos'], ['pcb_render'], ['schematic_pdf']]
 
 currentpath = os.path.dirname(os.getcwd())
-print(currentpath)
 
 for folders in folder_structure:
 	tempfolderpath = os.path.join(currentpath, folders[0])	
