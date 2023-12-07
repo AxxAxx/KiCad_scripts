@@ -17,5 +17,5 @@ for folders in folder_structure:
 			if not os.path.exists(tempsubfolderpath):
 				os.makedirs(tempsubfolderpath)
 				
-if not os.path.isfile(currentpath + "/3rd-parties-libraries/" + 'kicad_CSE_unpack.py'):
-                        os.replace(os.path.join(tempfolderpath + "/" + file, filename), currentpath + "/3D-models/" + filename)
+if not os.path.isfile(currentpath + '/3rd-parties-libraries' + '/kicad_CSE_unpack.py'):
+                        shutil.copyfile(os.path.join(os.getcwd()) + '/kicad_CSE_unpack.py', currentpath + '/3rd-parties-libraries' + '/kicad_CSE_unpack.py')
