@@ -36,7 +36,7 @@ for filename in os.listdir(zipfolders):
                 # Move 3D model to component folder
                 file = f.split('LIB_')[1].strip(".zip")+"/3D"
                 for filename in os.listdir(tempfolderpath + "/" + file):
-                    if not os.path.isfile(componentfolderpath + filename):
+                    if not os.path.isfile(componentfolderpath + "/" + filename):
                         os.replace(os.path.join(tempfolderpath + "/" + file, filename), os.path.join(componentfolderpath + "/" + filename))
                         print("moving file %s" % filename)
                     else:
@@ -46,7 +46,7 @@ for filename in os.listdir(zipfolders):
                 file = f.split('LIB_')[1].strip(".zip")+"/KiCad"
                 for filename in os.listdir(tempfolderpath + "/" + file):
                     if (filename.endswith('.kicad_mod') or filename.endswith('.kicad_sym')):
-                        if not os.path.isfile(componentfolderpath + filename):
+                        if not os.path.isfile(componentfolderpath + "/" + filename):
                             os.replace(os.path.join(tempfolderpath + "/" + file, filename), os.path.join(componentfolderpath + "/" + filename))
                             print("moving file %s" % filename)
                         else:
