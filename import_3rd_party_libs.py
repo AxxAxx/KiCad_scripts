@@ -78,27 +78,37 @@ MODEL_EXTS = (".stp", ".step", ".wrl")
 
 def extract_top_level_blocks(text, token):
     """Return the list of balanced-paren '(token ...)' blocks that sit at the
-    top level *inside* the root s-expression of `text`."""
+    top level *inside* the root s-expression of `text`.
+
+    KiCad files are s-expressions, e.g. a symbol library looks like:
+        (kicad_symbol_lib (version ..) (symbol "A" ..) (symbol "B" ..))
+    Calling this with token="symbol" returns the two '(symbol ..)' blocks.
+    We scan character by character and track paren depth (ignoring parens that
+    appear inside quoted strings) so nested parens don't confuse the split -
+    a plain regex can't match balanced parens reliably.
+    """
     blocks = []
     i = 0
     n = len(text)
     while i < n:
         if text[i] == "(":
+            # Peek at the first word after "(" to see if this is our token.
             m = re.match(r"\(\s*([A-Za-z0-9_]+)", text[i:])
             if m and m.group(1) == token:
+                # Found a matching block; walk forward until its parens close.
                 depth = 0
                 start = i
                 in_str = False
                 while i < n:
                     c = text[i]
                     if c == '"' and text[i - 1] != "\\":
-                        in_str = not in_str
+                        in_str = not in_str          # toggle string state
                     elif not in_str:
                         if c == "(":
                             depth += 1
                         elif c == ")":
                             depth -= 1
-                            if depth == 0:
+                            if depth == 0:           # block fully closed
                                 blocks.append(text[start : i + 1])
                                 i += 1
                                 break
@@ -109,6 +119,7 @@ def extract_top_level_blocks(text, token):
 
 
 def symbol_name(block):
+    """Extract the symbol name from a '(symbol "NAME" ...)' block, or None."""
     m = re.match(r'\(\s*symbol\s+"([^"]+)"', block)
     return m.group(1) if m else None
 
@@ -234,11 +245,22 @@ def copy_models(model_files):
 
 
 def register_lib(table_path, root_token, uri):
+    """Add (or refresh) our library entry in a KiCad library table file.
+
+    `table_path`  : the sym-lib-table or fp-lib-table file.
+    `root_token`  : "sym_lib_table" or "fp_lib_table" (the file's root node).
+    `uri`         : the ${KIPRJMOD}-relative path to our library.
+
+    Idempotent: re-running never creates a duplicate entry. Returns "created"
+    or "updated".
+    """
+    # The single (lib ...) line describing our library to KiCad.
     entry = (
         f'  (lib (name "{LIB_NICKNAME}")(type "KiCad")'
         f'(uri "{uri}")(options "")(descr "componentsearchengine 3rd-party parts"))'
     )
 
+    # No table yet -> create a fresh one containing just our entry.
     if not table_path.exists():
         table_path.write_text(
             f"({root_token}\n  (version 7)\n{entry}\n)\n", encoding="utf-8"
@@ -247,7 +269,8 @@ def register_lib(table_path, root_token, uri):
 
     text = table_path.read_text(encoding="utf-8")
 
-    # Drop any existing entry with our nickname so we can rewrite it cleanly.
+    # Remove any pre-existing entry with our nickname so we don't duplicate it
+    # (and so a changed uri/descr gets refreshed).
     text = re.sub(
         r'\n\s*\(lib \(name "' + re.escape(LIB_NICKNAME) + r'"\).*?\)\)',
         "",
@@ -255,6 +278,8 @@ def register_lib(table_path, root_token, uri):
         flags=re.DOTALL,
     )
 
+    # Splice our entry back in just before the table's final closing paren,
+    # leaving any other libraries in the table untouched.
     idx = text.rstrip().rfind(")")
     text = text[:idx] + entry + "\n" + text[idx:]
     table_path.write_text(text, encoding="utf-8")
