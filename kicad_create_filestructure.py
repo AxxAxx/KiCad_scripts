@@ -16,5 +16,10 @@ for folders in folder_structure:
 			if not os.path.exists(tempsubfolderpath):
 				os.makedirs(tempsubfolderpath)
 				
-if not os.path.isfile(currentpath + '/3rd-parties-libraries' + '/kicad_CSE_unpack.py'):
-                        shutil.copyfile(os.path.join(os.getcwd()) + '/kicad_CSE_unpack.py', currentpath + '/3rd-parties-libraries' + '/00_kicad_CSE_unpack.py')
+# Deploy the 3rd-party library import script into 3rd-parties-libraries/.
+# It consolidates componentsearchengine zips into merged symbol / footprint /
+# 3D-model libraries and registers them in the project's library tables.
+source_script = os.path.join(os.getcwd(), 'import_3rd_party_libs.py')
+deployed_script = os.path.join(currentpath, '3rd-parties-libraries', '00_import_3rd_party_libs.py')
+if not os.path.isfile(deployed_script):
+	shutil.copyfile(source_script, deployed_script)
