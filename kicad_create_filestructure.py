@@ -22,8 +22,8 @@ It does two things:
 
 After bootstrapping: drop componentsearchengine .zip archives into
 3rd-parties-libraries/00_componentsearchengine_ZIP_archives/ and run the
-deployed importer to build the "00_CSE" libraries. See README.md for the full
-workflow.
+deployed importer to build one self-contained library folder per part. See
+README.md for the full workflow.
 
 Standard library only - runs on any Python 3 (including the one bundled with
 KiCad).
@@ -67,9 +67,9 @@ for entry in FOLDER_STRUCTURE:
 # --- 2. Deploy the 3rd-party library importer --------------------------------
 # Copy import_3rd_party_libs.py (sitting next to this script) into
 # 3rd-parties-libraries/ as 00_import_3rd_party_libs.py. The "00_" prefix keeps
-# it sorted next to the archive folder. The importer consolidates
-# componentsearchengine zips into merged symbol / footprint / 3D-model libraries
-# and registers them in the project's library tables.
+# it sorted next to the archive folder. The importer unpacks each
+# componentsearchengine zip into its own per-part library folder and registers
+# it in the project's library tables.
 source_script = os.path.join(script_dir, "import_3rd_party_libs.py")
 deployed_script = os.path.join(
     project_root, "3rd-parties-libraries", "00_import_3rd_party_libs.py"

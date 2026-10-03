@@ -2,37 +2,39 @@
 """
 import_3rd_party_libs.py
 
-Unpacks componentsearchengine / SamacSys ECAD zip archives and consolidates the
-KiCad assets (schematic symbols, footprints, 3D models) into a single set of
-project-local libraries, then registers them in the project's library tables.
+Unpacks componentsearchengine / SamacSys ECAD zip archives into project-local
+KiCad libraries, using a SELF-CONTAINED, ONE-FOLDER-PER-PART layout, and
+registers each part in the project's library tables.
 
-This script lives in (and operates on) the 3rd-parties-libraries folder. Run it
-from anywhere - paths are resolved relative to this file:
+Run it from anywhere - paths are resolved relative to this file:
 
     python 3rd-parties-libraries/import_3rd_party_libs.py
 
 Re-run any time you drop new .zip archives into the archive folder.
 
-PRESERVES YOUR EDITS: if a symbol / footprint / 3D model is already present in
-the generated libraries, it is left untouched. Only parts that are not yet
-loaded get imported. So if you tweak a symbol or footprint in KiCad, a re-run
-will not clobber your changes. To force a part to be re-imported from its zip,
-delete it from the generated library first (or delete the symbol block from
-cse.kicad_sym) and re-run.
-
-Resulting layout:
+Resulting layout (one folder per part, nickname = part name):
 
     3rd-parties-libraries/
     |- import_3rd_party_libs.py                 (this script)
     |- 00_componentsearchengine_ZIP_archives/   (your zips - untouched)
-    |- symbols/     cse.kicad_sym               (all symbols, merged)
-    |- footprints/  cse.pretty/*.kicad_mod      (all footprints, 3D paths fixed)
-    |- 3dmodels/    *.stp/.step/.wrl            (all 3D models)
+    |- <PART>/
+    |     <PART>.kicad_sym       (just this one symbol)
+    |     <FOOTPRINT>.kicad_mod  (3D path rewritten to this folder)
+    |     <PART>.stp             (the 3D model)
 
-Library nickname registered in sym-lib-table / fp-lib-table: "00_CSE"
-(the leading "00_" sorts it to the top of KiCad's library lists).
+Each part is registered under its own nickname (the part name) in both
+sym-lib-table and fp-lib-table, so a schematic symbol and its footprint share
+one nickname, e.g. lib_id "INA226AIDGSR:INA226AIDGSR" and footprint
+"INA226AIDGSR:SOP50P490X110-10N". A folder copies between projects verbatim.
+
+The footprint library is registered as a plain folder (KiCad type), not a
+".pretty" - KiCad reads .kicad_mod files from any folder given as the URI.
 
 3D model paths are rewritten to ${KIPRJMOD}/... so the project stays portable.
+
+PRESERVES YOUR EDITS: a part whose <PART>/ folder already exists is left
+untouched - only new parts get imported. To force a re-import, delete the
+part's folder and re-run.
 
 Standard library only - runs on any Python 3 (including the one bundled with
 KiCad).
@@ -45,288 +47,242 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Configuration
-# ---------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------- #
+BS = chr(92)  # backslash
 LIB_ROOT = Path(__file__).resolve().parent          # 3rd-parties-libraries/
-PROJECT_ROOT = LIB_ROOT.parent                        # KiCad project directory
+PROJECT_ROOT = LIB_ROOT.parent                       # KiCad project directory
 ARCHIVE_DIR = LIB_ROOT / "00_componentsearchengine_ZIP_archives"
+REL = "3rd-parties-libraries"                        # ${KIPRJMOD}-relative root
 
-SYMBOLS_DIR = LIB_ROOT / "symbols"
-FOOTPRINTS_DIR = LIB_ROOT / "footprints" / "cse.pretty"
-MODELS_DIR = LIB_ROOT / "3dmodels"
+SYM_TABLE = PROJECT_ROOT / "sym-lib-table"
+FP_TABLE = PROJECT_ROOT / "fp-lib-table"
 
-MERGED_SYM = SYMBOLS_DIR / "cse.kicad_sym"
-
-# Library nickname shown in KiCad. The leading "00_" sorts it to the top of
-# the (alphabetically sorted) library lists.
-LIB_NICKNAME = "00_CSE"
-
-# Paths (relative to the project dir) that footprints and lib tables point at,
-# via the ${KIPRJMOD} KiCad environment variable (= the project directory).
-REL_MODELS = "3rd-parties-libraries/3dmodels"
-REL_SYMBOLS = "3rd-parties-libraries/symbols/cse.kicad_sym"
-REL_FOOTPRINTS = "3rd-parties-libraries/footprints/cse.pretty"
-
+SYM_HEADER = ("(kicad_symbol_lib (version 20211014) "
+              "(generator SamacSys_ECAD_Model)\n")
 MODEL_EXTS = (".stp", ".step", ".wrl")
+MODEL_RE = re.compile(r'(\(model\s+)"?[^"\s)]+"?', re.IGNORECASE)
 
-# ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
 # S-expression helpers
-# ---------------------------------------------------------------------------
-
-
-def extract_top_level_blocks(text, token):
-    """Return the list of balanced-paren '(token ...)' blocks that sit at the
-    top level *inside* the root s-expression of `text`.
-
-    KiCad files are s-expressions, e.g. a symbol library looks like:
-        (kicad_symbol_lib (version ..) (symbol "A" ..) (symbol "B" ..))
-    Calling this with token="symbol" returns the two '(symbol ..)' blocks.
-    We scan character by character and track paren depth (ignoring parens that
-    appear inside quoted strings) so nested parens don't confuse the split -
-    a plain regex can't match balanced parens reliably.
-    """
-    blocks = []
-    i = 0
+# --------------------------------------------------------------------------- #
+def balanced(text, start):
+    """Return (block, end_index) for the balanced-paren block starting at
+    `start` (a '('). Quoted strings are respected so nested parens inside
+    strings don't confuse the depth count."""
+    depth = 0
+    in_str = False
+    j = start
     n = len(text)
+    while j < n:
+        c = text[j]
+        p = text[j - 1] if j else ''
+        if c == '"' and p != BS:
+            in_str = not in_str
+        elif not in_str:
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return text[start:j + 1], j + 1
+        j += 1
+    return text[start:], n
+
+
+_SYM_HDR = re.compile(r"\(\s*symbol\b")
+_SYM_NAME = re.compile(r'\(\s*symbol\s+"([^"]+)"')
+
+
+def top_level_symbols(text):
+    """{name: block} for each top-level (symbol "name" ...) in a lib file."""
+    out = {}
+    i, n = 0, len(text)
     while i < n:
-        if text[i] == "(":
-            # Peek at the first word after "(" to see if this is our token.
-            m = re.match(r"\(\s*([A-Za-z0-9_]+)", text[i:])
-            if m and m.group(1) == token:
-                # Found a matching block; walk forward until its parens close.
-                depth = 0
-                start = i
-                in_str = False
-                while i < n:
-                    c = text[i]
-                    if c == '"' and text[i - 1] != "\\":
-                        in_str = not in_str          # toggle string state
-                    elif not in_str:
-                        if c == "(":
-                            depth += 1
-                        elif c == ")":
-                            depth -= 1
-                            if depth == 0:           # block fully closed
-                                blocks.append(text[start : i + 1])
-                                i += 1
-                                break
-                    i += 1
+        if text[i] == "(" and _SYM_HDR.match(text, i):
+            block, end = balanced(text, i)
+            m = _SYM_NAME.match(block)
+            if m:
+                out[m.group(1)] = block
+                i = end
                 continue
         i += 1
-    return blocks
+    return out
 
 
-def symbol_name(block):
-    """Extract the symbol name from a '(symbol "NAME" ...)' block, or None."""
-    m = re.match(r'\(\s*symbol\s+"([^"]+)"', block)
-    return m.group(1) if m else None
+def footprint_name(block):
+    """Bare footprint name from a symbol's Footprint property ('' if none)."""
+    m = re.search(r'\(property\s+"Footprint"\s+"([^"]*)"', block)
+    if not m:
+        return ""
+    val = m.group(1)
+    return val.split(":", 1)[1] if ":" in val else val
 
 
-# ---------------------------------------------------------------------------
-# Steps
-# ---------------------------------------------------------------------------
+def model_base(mod_text):
+    m = re.search(r'\(model\s+"?([^"\s)]+)"?', mod_text)
+    return m.group(1).replace(BS, "/").split("/")[-1] if m else None
 
 
-def find_archives():
+# --------------------------------------------------------------------------- #
+# Import one part into its own folder
+# --------------------------------------------------------------------------- #
+def write_symbol_lib(folder, part, block, fp):
+    """Write <part>/<part>.kicad_sym containing just this symbol, with its
+    Footprint property repointed to '<part>:<fp>'."""
+    if fp:
+        block = re.sub(r'(\(property\s+"Footprint"\s+)"[^"]*"',
+                       r'\1"' + f"{part}:{fp}" + '"', block, count=1)
+    body = "  " + block.replace("\n", "\n  ")
+    (folder / f"{part}.kicad_sym").write_text(
+        SYM_HEADER + body + "\n)\n", encoding="utf-8")
+
+
+def copy_footprint(folder, part, mod_path, models):
+    """Copy a .kicad_mod into the part folder, copying its referenced 3D model
+    alongside and rewriting the (model ..) path to point inside the folder."""
+    text = mod_path.read_text(encoding="utf-8")
+    base = model_base(text)
+    chosen = None
+    # prefer a model named after the part, else the one the footprint names,
+    # else the single model shipped in the zip
+    prefer = f"{part}.stp"
+    if prefer in models:
+        chosen = prefer
+    elif base and base in models:
+        chosen = base
+    elif len(models) == 1:
+        chosen = next(iter(models))
+    if chosen:
+        shutil.copy2(models[chosen], folder / chosen)
+        new_path = f'"${{KIPRJMOD}}/{REL}/{part}/{chosen}"'
+        text = MODEL_RE.sub(lambda m: m.group(1) + new_path, text, count=1)
+    (folder / mod_path.name).write_text(text, encoding="utf-8")
+    return chosen
+
+
+def import_zip(zpath, workdir):
+    """Extract one archive and import each part it contains. Returns a list of
+    (part, status) where status is 'imported' or 'exists'."""
+    dest = workdir / zpath.stem
+    with zipfile.ZipFile(zpath) as zf:
+        zf.extractall(dest)
+
+    sym_files = list(dest.rglob("KiCad/*.kicad_sym"))
+    fp_files = {p.stem: p for p in dest.rglob("KiCad/*.kicad_mod")}
+    models = {}
+    for ext in MODEL_EXTS:
+        for m in dest.rglob(f"3D/*{ext}"):
+            models[m.name] = m
+
+    results = []
+    imported_parts, imported_fp_libs = [], []
+
+    # collect every symbol across the zip's .kicad_sym file(s)
+    symbols = {}
+    for sf in sym_files:
+        symbols.update(top_level_symbols(sf.read_text(encoding="utf-8")))
+
+    used_fp_stems = set()
+    for part, block in symbols.items():
+        fp = footprint_name(block)
+        # this part's footprint (match by the Footprint prop's name; if the zip
+        # ships exactly one footprint, use it). Mark it used either way so the
+        # footprint-only pass below never makes a stray folder for it.
+        mod = fp_files.get(fp) or (next(iter(fp_files.values()))
+                                   if len(fp_files) == 1 else None)
+        if mod:
+            used_fp_stems.add(mod.stem)
+        folder = LIB_ROOT / part
+        if folder.exists():
+            results.append((part, "exists"))
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        write_symbol_lib(folder, part, block, fp)
+        imported_parts.append(part)
+        if mod:
+            copy_footprint(folder, part, mod, models)
+            imported_fp_libs.append(part)
+        results.append((part, "imported"))
+
+    # any footprint in the zip not tied to a symbol (e.g. a connector whose
+    # symbol is a KiCad built-in) becomes a footprint-only library
+    for stem, mod in fp_files.items():
+        if stem in used_fp_stems:
+            continue
+        folder = LIB_ROOT / stem
+        if folder.exists():
+            results.append((stem, "exists"))
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        copy_footprint(folder, stem, mod, models)
+        imported_fp_libs.append(stem)
+        results.append((stem + " (footprint-only)", "imported"))
+
+    return results, imported_parts, imported_fp_libs
+
+
+# --------------------------------------------------------------------------- #
+# Library-table registration (idempotent, per-part)
+# --------------------------------------------------------------------------- #
+def register(table_path, root_token, nick, uri, descr):
+    """Add or refresh a single (lib ..) entry, leaving other entries intact."""
+    entry = (f'  (lib (name "{nick}")(type "KiCad")(uri "{uri}")'
+             f'(options "")(descr "{descr}"))')
+    if not table_path.exists():
+        table_path.write_text(f"({root_token}\n  (version 7)\n{entry}\n)\n",
+                              encoding="utf-8")
+        return
+    text = table_path.read_text(encoding="utf-8")
+    # drop any existing entry with this nickname so the uri/descr refresh
+    text = re.sub(r'\n\s*\(lib \(name "' + re.escape(nick) + r'"\).*?\)\)',
+                  "", text, flags=re.DOTALL)
+    idx = text.rstrip().rfind(")")
+    table_path.write_text(text[:idx] + entry + "\n" + text[idx:],
+                          encoding="utf-8")
+
+
+def register_part(nick, *, symbol, footprint):
+    if symbol:
+        register(SYM_TABLE, "sym_lib_table", nick,
+                 f"${{KIPRJMOD}}/{REL}/{nick}/{nick}.kicad_sym",
+                 f"3rd-party part {nick}")
+    if footprint:
+        register(FP_TABLE, "fp_lib_table", nick,
+                 f"${{KIPRJMOD}}/{REL}/{nick}",
+                 f"3rd-party footprints for {nick}")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    print(f"Project root : {PROJECT_ROOT}")
     zips = sorted(ARCHIVE_DIR.glob("*.zip"))
     if not zips:
         sys.exit(f"No .zip archives found in {ARCHIVE_DIR}")
-    return zips
+    print(f"Archives     : {len(zips)} found\n")
 
-
-def ensure_dirs():
-    for d in (SYMBOLS_DIR, FOOTPRINTS_DIR, MODELS_DIR):
-        d.mkdir(parents=True, exist_ok=True)
-
-
-def collect_from_archives(zips, workdir):
-    """Extract each zip and return (symbol_files, footprint_files, model_files)."""
-    sym_files, fp_files, model_files = [], [], []
-    for z in zips:
-        dest = workdir / z.stem
-        with zipfile.ZipFile(z) as zf:
-            zf.extractall(dest)
-        sym_files += list(dest.rglob("KiCad/*.kicad_sym"))
-        fp_files += list(dest.rglob("KiCad/*.kicad_mod"))
-        for ext in MODEL_EXTS:
-            model_files += list(dest.rglob(f"3D/*{ext}"))
-    return sym_files, fp_files, model_files
-
-
-def prefix_footprint_property(block):
-    """Rewrite the symbol's Footprint field to '<nickname>:<name>' so KiCad
-    auto-associates the footprint. Leaves already-qualified ('lib:fp') values
-    alone."""
-
-    def repl(m):
-        value = m.group(2)
-        if not value or ":" in value:
-            return m.group(0)
-        return f'{m.group(1)}"{LIB_NICKNAME}:{value}"'
-
-    return re.sub(
-        r'(\(property\s+"Footprint"\s+)"([^"]*)"', repl, block, count=1
-    )
-
-
-def load_existing_symbols():
-    """Ordered {name: block} of symbols already in the merged library."""
-    existing = {}
-    if MERGED_SYM.exists():
-        text = MERGED_SYM.read_text(encoding="utf-8")
-        for block in extract_top_level_blocks(text, "symbol"):
-            name = symbol_name(block)
-            if name:
-                existing[name] = block
-    return existing
-
-
-def merge_symbols(sym_files):
-    """Add not-yet-loaded symbols to the merged library, preserving existing
-    ones verbatim. Returns (added, preserved)."""
-    result = load_existing_symbols()      # preserve existing edits
-    preserved = len(result)
-    added = 0
-    for f in sym_files:
-        text = f.read_text(encoding="utf-8")
-        for block in extract_top_level_blocks(text, "symbol"):
-            name = symbol_name(block)
-            if name is None or name in result:
-                continue
-            result[name] = prefix_footprint_property(block)
-            added += 1
-
-    header = "(kicad_symbol_lib (version 20211014) (generator SamacSys_ECAD_Model)\n"
-    body = "\n".join("  " + b.replace("\n", "\n  ") for b in result.values())
-    MERGED_SYM.write_text(header + body + "\n)\n", encoding="utf-8")
-    return added, preserved
-
-
-MODEL_RE = re.compile(r'\(model\s+"?([^"\s)]+)"?', re.IGNORECASE)
-
-
-def rewrite_model_path(match):
-    base = Path(match.group(1).replace("\\", "/")).name
-    return f'(model "${{KIPRJMOD}}/{REL_MODELS}/{base}"'
-
-
-def copy_footprints(fp_files):
-    """Copy not-yet-loaded footprints (3D path rewritten). Returns (added, kept)."""
-    added = kept = 0
-    for f in fp_files:
-        dest = FOOTPRINTS_DIR / f.name
-        if dest.exists():
-            kept += 1
-            continue
-        text = MODEL_RE.sub(rewrite_model_path, f.read_text(encoding="utf-8"))
-        dest.write_text(text, encoding="utf-8")
-        added += 1
-    return added, kept
-
-
-def copy_models(model_files):
-    """Copy not-yet-loaded 3D models. Returns (added, kept)."""
-    added = kept = 0
-    for f in model_files:
-        dest = MODELS_DIR / f.name
-        if dest.exists():
-            kept += 1
-            continue
-        shutil.copy2(f, dest)
-        added += 1
-    return added, kept
-
-
-# ---------------------------------------------------------------------------
-# Library-table registration (idempotent)
-# ---------------------------------------------------------------------------
-
-
-def register_lib(table_path, root_token, uri):
-    """Add (or refresh) our library entry in a KiCad library table file.
-
-    `table_path`  : the sym-lib-table or fp-lib-table file.
-    `root_token`  : "sym_lib_table" or "fp_lib_table" (the file's root node).
-    `uri`         : the ${KIPRJMOD}-relative path to our library.
-
-    Idempotent: re-running never creates a duplicate entry. Returns "created"
-    or "updated".
-    """
-    # The single (lib ...) line describing our library to KiCad.
-    entry = (
-        f'  (lib (name "{LIB_NICKNAME}")(type "KiCad")'
-        f'(uri "{uri}")(options "")(descr "componentsearchengine 3rd-party parts"))'
-    )
-
-    # No table yet -> create a fresh one containing just our entry.
-    if not table_path.exists():
-        table_path.write_text(
-            f"({root_token}\n  (version 7)\n{entry}\n)\n", encoding="utf-8"
-        )
-        return "created"
-
-    text = table_path.read_text(encoding="utf-8")
-
-    # Remove any pre-existing entry with our nickname so we don't duplicate it
-    # (and so a changed uri/descr gets refreshed).
-    text = re.sub(
-        r'\n\s*\(lib \(name "' + re.escape(LIB_NICKNAME) + r'"\).*?\)\)',
-        "",
-        text,
-        flags=re.DOTALL,
-    )
-
-    # Splice our entry back in just before the table's final closing paren,
-    # leaving any other libraries in the table untouched.
-    idx = text.rstrip().rfind(")")
-    text = text[:idx] + entry + "\n" + text[idx:]
-    table_path.write_text(text, encoding="utf-8")
-    return "updated"
-
-
-def register_tables():
-    s = register_lib(
-        PROJECT_ROOT / "sym-lib-table",
-        "sym_lib_table",
-        "${KIPRJMOD}/" + REL_SYMBOLS,
-    )
-    f = register_lib(
-        PROJECT_ROOT / "fp-lib-table",
-        "fp_lib_table",
-        "${KIPRJMOD}/" + REL_FOOTPRINTS,
-    )
-    return s, f
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main():
-    print(f"Project root : {PROJECT_ROOT}")
-    zips = find_archives()
-    print(f"Archives     : {len(zips)} found")
-
-    ensure_dirs()
-
+    total_new = total_exist = 0
     with tempfile.TemporaryDirectory() as tmp:
-        sym_files, fp_files, model_files = collect_from_archives(zips, Path(tmp))
-        sym_added, sym_kept = merge_symbols(sym_files)
-        fp_added, fp_kept = copy_footprints(fp_files)
-        mod_added, mod_kept = copy_models(model_files)
+        for z in zips:
+            results, sym_parts, fp_parts = import_zip(z, Path(tmp))
+            for nick in sym_parts:
+                register_part(nick, symbol=True, footprint=(nick in fp_parts))
+            for nick in fp_parts:
+                if nick not in sym_parts:            # footprint-only lib
+                    register_part(nick, symbol=False, footprint=True)
+            for part, status in results:
+                mark = "+" if status == "imported" else "="
+                print(f"  {mark} {part}  ({status})")
+                total_new += status == "imported"
+                total_exist += status == "exists"
 
-    sym_state, fp_state = register_tables()
-
-    print("\nDone. (existing parts preserved, not overwritten)")
-    print(f"  Symbols    : +{sym_added} new, {sym_kept} preserved  -> {MERGED_SYM}")
-    print(f"  Footprints : +{fp_added} new, {fp_kept} preserved  -> {FOOTPRINTS_DIR}")
-    print(f"  3D models  : +{mod_added} new, {mod_kept} preserved  -> {MODELS_DIR}")
-    print(f"  sym-lib-table : {sym_state} (nickname '{LIB_NICKNAME}')")
-    print(f"  fp-lib-table  : {fp_state} (nickname '{LIB_NICKNAME}')")
-    print(f"\nOpen (or reopen) the project in KiCad - the '{LIB_NICKNAME}' libraries are ready.")
+    print(f"\nDone. {total_new} new part(s) imported, "
+          f"{total_exist} already present (left untouched).")
+    print("Reopen the project in KiCad (or rescan libraries) to see new parts.")
 
 
 if __name__ == "__main__":
